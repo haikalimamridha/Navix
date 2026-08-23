@@ -3,10 +3,9 @@
 import { useState } from "react";
 import { Loader2, Play } from "lucide-react";
 import type { ShipmentInput } from "@/lib/types";
-import { Province, Cities } from "@/lib/geo";
+import { Cities } from "@/lib/geo";
 
 export const SHIP_MODES = ["Ocean (container)", "Air", "Rail", "Truck"];
-export const CONTAINER_SIZES = ["20ft", "40ft", "40ft HC", "LCL", "Pallets", "Air ULD"];
 export const SPECIAL_REQS = ["Standard (ambient)", "Refrigerated", "Frozen", "Fragile", "Hazardous", "Organic"];
 
 export const presets: {
