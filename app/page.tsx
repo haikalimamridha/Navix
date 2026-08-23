@@ -7,9 +7,44 @@ import type { ShipmentInput } from "@/lib/types";
 
 export default function Home() {
   const [loading, setLoading] = useState(false);
+  const [result, setResult] = useState<unknown>(null);
+  const [error, setError] = useState<string | null>(null);
 
-  const handleSubmit = (input: ShipmentInput) => {
+  const handleSubmit = async (input: ShipmentInput) => {
+    setLoading(true);
+    setResult(null);
+    setError(null);
     console.log("Shipment Input:", input);
+
+    try {
+      const response = await fetch("/api/analyze", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(input),
+      });
+
+      if (!response.ok) {
+        throw new Error(`Request failed (${response.status})`);
+      }
+
+      const data = await response.json();
+
+      console.log("Analysis Result:", data);
+
+      setResult(data);
+    } catch (err) {
+      console.error("Risk analysis failed:", err);
+
+      setError(
+        err instanceof Error
+          ? err.message
+          : "Risk analysis failed"
+      );
+    } finally {
+      setLoading(false);
+    }
   };
 
   return (
@@ -22,7 +57,7 @@ export default function Home() {
 
           {/* HERO */}
           <div className="text-center mb-10">
-            <h1 className="serif text-4xl sm:text-5xl">
+            <h1 className="font-semibold text-4xl sm:text-5xl">
               Predict supply chain risk before it happens.
             </h1>
 
