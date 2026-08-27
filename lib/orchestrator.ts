@@ -18,8 +18,9 @@ import {
   portRecommenderAgent,
   productAgent,
   synthesisAgent,
-  intelAgent,
+  intelBatchAgent,
   regulatoryAgent,
+  finalDecisionAgent,
 } from "./agents";
 import { brightDataMode, getSearchLog, resetSearchLog } from "./brightdata";
 import { buildDrivers } from "./drivers";
@@ -90,49 +91,69 @@ export async function runAnalysis(
       return null;
     });
 
-    // --- Regulatory agent (concurrent) ---
-    emit({ type: "agent", id: "regulatory", name: "Regulatory Agent", status: "running", });
-    const regulatoryPromise = regulatoryAgent(input, profile)
-    .then((r) => {
-        emit({
-        type: "agent",
-        id: "regulatory",
-        name: "Regulatory Agent",
-        status: "done",
-        summary: r ? "Indonesian domestic regulations analyzed" : "no data",
-        });
-        return r;
-    })
-    .catch((err) => {
-        emit({
-        type: "agent",
-        id: "regulatory",
-        name: "Regulatory Agent",
-        status: "error",
-        summary: String(err),
-        });
-        return null;
-    });
-
   // --- Step 2: intelligence agents in parallel ---
   const specs = buildIntelSpecs(input, profile);
   const context = `${input.product} (${profile.productCategory}), ${input.weightKg}kg, ${input.origin_city}, ${input.origin_province} -> ${input.destination_city}, ${input.destination_province}, ship date ${input.shipDate}`;
 
   specs.forEach((s) => emit({ type: "agent", id: s.id, name: s.name, status: "running" }));
 
-  const factorResults = await Promise.all(
-    specs.map(async (spec) => {
-      try {
-        const { factor } = await intelAgent(spec, context);
-        emit({ type: "agent", id: spec.id, name: spec.name, status: "done", summary: `risk ${factor.score}/100 · ${factor.label}` });
-        return factor;
-      } catch (err) {
-        emit({ type: "agent", id: spec.id, name: spec.name, status: "error", summary: String(err) });
-        return null;
-      }
-    }),
-  );
-  const factors = factorResults.filter(Boolean) as RiskFactor[];
+//   const factorResults = await Promise.all(
+//     specs.map(async (spec) => {
+//       try {
+//         const { factor } = await intelBatchAgent(spec, context);
+//         emit({ type: "agent", id: spec.id, name: spec.name, status: "done", summary: `risk ${factor.score}/100 · ${factor.label}` });
+//         return factor;
+//       } catch (err) {
+//         emit({ type: "agent", id: spec.id, name: spec.name, status: "error", summary: String(err) });
+//         return null;
+//       }
+//     }),
+//   );
+//   const factors = factorResults.filter(Boolean) as RiskFactor[];
+
+    let factors: RiskFactor[];
+
+    try {
+    factors = await intelBatchAgent(specs, context);
+
+    /*
+    * The batch LLM returns all seven categories,
+    * so update the dashboard individually.
+    */
+
+    for (const spec of specs) {
+        const factor = factors.find(
+        (f) => f.category === spec.category,
+        );
+
+        emit({
+        type: "agent",
+        id: spec.id,
+        name: spec.name,
+        status: factor ? "done" : "error",
+        summary: factor
+            ? `risk ${factor.score}/100 · ${factor.label}`
+            : "no data",
+        });
+    }
+    } catch (err) {
+    /*
+    * This should rarely happen because intelBatchAgent
+    * already has fallbacks.
+    */
+
+    factors = [];
+
+    for (const spec of specs) {
+        emit({
+        type: "agent",
+        id: spec.id,
+        name: spec.name,
+        status: "error",
+        summary: "intelligence analysis failed",
+        });
+    }
+    }
 
   const riskScore = weightedRiskScore(factors);
 
@@ -149,14 +170,44 @@ export async function runAnalysis(
   emit({ type: "agent", id: "synthesis", name: "Cost, Route & Alert Engine", status: "done", summary: `+${synthesis.expectedCostIncreasePct}% cost · ${synthesis.expectedDelayDays[0]}–${synthesis.expectedDelayDays[1]}d delay` });
 
   // --- Step 4: executive summary + prioritized action plan (parallel) ---
-  emit({ type: "agent", id: "summary", name: "Executive Summary Agent", status: "running" });
-  emit({ type: "agent", id: "plan", name: "Action Plan Agent", status: "running" });
-  const [executiveSummary, actionPlan] = await Promise.all([
-    executiveSummaryAgent(input, factors, riskScore, synthesis),
-    actionPlanAgent(input, factors, synthesis),
-  ]);
-  emit({ type: "agent", id: "summary", name: "Executive Summary Agent", status: "done" });
-  emit({ type: "agent", id: "plan", name: "Action Plan Agent", status: "done", summary: `${actionPlan.length} prioritized actions` });
+    emit({
+    type: "agent",
+    id: "summary",
+    name: "Executive Summary Agent",
+    status: "running",
+    });
+
+    emit({
+    type: "agent",
+    id: "plan",
+    name: "Action Plan Agent",
+    status: "running",
+    });
+
+    const {
+    executiveSummary,
+    actionPlan,
+    } = await finalDecisionAgent(
+    input,
+    factors,
+    riskScore,
+    synthesis,
+    );
+
+    emit({
+    type: "agent",
+    id: "summary",
+    name: "Executive Summary Agent",
+    status: "done",
+    });
+
+    emit({
+    type: "agent",
+    id: "plan",
+    name: "Action Plan Agent",
+    status: "done",
+    summary: `${actionPlan.length} prioritized actions`,
+    });
 
   // --- assemble ---
   const dependencyGraph: DependencyNode[] = [

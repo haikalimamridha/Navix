@@ -41,6 +41,7 @@ export interface ProductProfile {
 
 export async function productAgent(input: ShipmentInput): Promise<ProductProfile> {
   const sources = await bdSearch(`${input.product} materials composition manufacturing HS code Indonesia`, 4);
+  const compactSources = sources .slice(0, 3) .map(compactSource);
 
   const guess = guessMaterials(input.product);
   const fallback: ProductProfile = {
@@ -51,24 +52,26 @@ export async function productAgent(input: ShipmentInput): Promise<ProductProfile
     sources,
   };
 
-  const result = await jsonCompletion<ProductProfile>({
-    system:
-        "You are a product analysis and bill-of-materials expert for Indonesian supply chains. " +
-        "Given a product, identify its category, likely HS (Harmonized System) codes, the raw-material " +
-        "composition by approximate weight percentage (must sum to ~100), and upstream commodity, " +
-        "manufacturing, and logistics dependencies that affect its landed cost in Indonesia. " +
-        "Consider Indonesian import and domestic supply-chain context when relevant. " +
-        "productCategory MUST be concise: 2-4 words, no semicolons or clauses (e.g. 'Frozen shrimp', 'Plastic furniture'). " +
-        "Respond ONLY with JSON.",
-    user:
-        `Product: ${input.product}\nOrigin: ${input.origin_city}, ${input.origin_province}, Indonesia\nDestination: ${input.destination_city}, ${input.destination_province}, Indonesia\n` +
-        `Approx weight (kg): ${input.weightKg}\n\n` +
-        `Reference snippets from the web:\n${sources.map((s) => `- ${s.title}: ${s.snippet ?? ""}`).join("\n")}\n\n` +
-        `Return JSON of shape:\n` +
-        `{"productCategory": string, "hsCodes": string[], "materials": [{"material": string, "pct": number}], ` +
-        `"dependencies": string[]}`,
-    fallback,
-  });
+    const result = await jsonCompletion<ProductProfile>({
+      system:
+          "You are a product analysis and bill-of-materials expert for Indonesian supply chains. " +
+          "Given a product, identify its category, likely HS (Harmonized System) codes, the raw-material " +
+          "composition by approximate weight percentage (must sum to ~100), and upstream commodity, " +
+          "manufacturing, and logistics dependencies that affect its landed cost in Indonesia. " +
+          "Consider Indonesian import and domestic supply-chain context when relevant. " +
+          "productCategory MUST be concise: 2-4 words, no semicolons or clauses (e.g. 'Frozen shrimp', 'Plastic furniture'). " +
+          "Respond ONLY with JSON.",
+      user:
+          `Product: ${input.product}\nOrigin: ${input.origin_city}, ${input.origin_province}, Indonesia\nDestination: ${input.destination_city}, ${input.destination_province}, Indonesia\n` +
+          `Approx weight (kg): ${input.weightKg}\n\n` +
+          `Reference snippets from the web:\n${ compactSources.length > 0 ? compactSources .map( (s) => `- ${s.title}: ${s.snippet}` + (s.url ? ` (${s.url})` : ""), ) .join("\n") : "(no fresh web results)" }\n\n` +
+          `Return JSON of shape:\n` +
+          `{"productCategory": string, "hsCodes": string[], "materials": [{"material": string, "pct": number}], ` +
+          `"dependencies": string[]}`,
+      fallback,
+      agent: "product",
+      maxTokens: 1000
+    });
 
   // attach sources + normalize material percentages    
   const total = result.materials?.reduce((a:number, m:MaterialBreakdown) => a + (m.pct || 0), 0) || 0;
@@ -122,6 +125,8 @@ export async function intelAgent(spec: IntelSpec, context: string): Promise<{ fa
       `"actionable": string (one concrete, time-bound action/insight), "detail": string (2-3 sentences), ` +
       `"trend": "up"|"down"|"flat", "keyFindings": string[] (2-4 bullets)}`,
     fallback,
+    agent: "product",
+    maxTokens: 800,
   });
 
   return {
@@ -220,14 +225,389 @@ export function buildIntelSpecs(input: ShipmentInput, profile: ProductProfile): 
     ];
 }
 
+export async function intelBatchAgent(
+  specs: IntelSpec[],
+  context: string,
+): Promise<RiskFactor[]> {
+  console.log(
+    `[intelBatch] Starting ${specs.length} intelligence categories...`,
+  );
+
+  // -------------------------------------------------------------------------
+  // 1. Run ALL Bright Data searches in parallel
+  // -------------------------------------------------------------------------
+
+  const searchResults = await Promise.all(
+    specs.map(async (spec) => {
+      console.log(
+        `[intelBatch:${spec.id}] Starting ${spec.queries.length} searches...`,
+      );
+
+      const results = await Promise.all(
+        spec.queries.map(async (query) => {
+          try {
+            const sources = await bdSearch(query, 3);
+
+            console.log(
+              `[intelBatch:${spec.id}] "${query}" -> ${sources.length} sources`,
+            );
+
+            return sources;
+          } catch (error) {
+            console.error(
+              `[intelBatch:${spec.id}] Search failed:`,
+              error,
+            );
+
+            // Jangan biarkan satu search menggagalkan seluruh pipeline.
+            return [];
+          }
+        }),
+      );
+
+      // ---------------------------------------------------------------------
+      // Deduplicate + validate sources
+      // ---------------------------------------------------------------------
+
+      const sources = dedupeSources(
+        results
+          .flat()
+          .filter(
+            (source) =>
+              source &&
+              typeof source.url === "string" &&
+              source.url.trim().length > 0 &&
+              (
+                source.title?.trim().length > 0 ||
+                (source.snippet?.trim().length ?? 0) > 0
+              ),
+          ),
+      ).slice(0, 5);
+
+      console.log(
+        `[intelBatch:${spec.id}] ${sources.length} valid sources`,
+      );
+
+      return {
+        spec,
+        sources,
+      };
+    }),
+  );
+
+  // -------------------------------------------------------------------------
+  // 2. Build deterministic fallbacks
+  // -------------------------------------------------------------------------
+
+  const fallbacks = searchResults.map(({ spec, sources }) =>
+    heuristicFactor(spec, sources),
+  );
+
+  // -------------------------------------------------------------------------
+  // 3. Prepare intelligence input for ONE LLM call
+  // -------------------------------------------------------------------------
+  function compactIntelSource(source: Source) {
+    return {
+      title: (source.title ?? "").trim().slice(0, 140),
+      snippet: (source.snippet ?? "").trim().slice(0, 280),
+      url: (source.url ?? "").trim().slice(0, 300),
+    };
+  } 
+
+  const intelligenceInput = searchResults
+    .map(({ spec, sources }, index) => {
+      const compactSources = sources.slice(0, 2).map((source) => ({
+        title: (source.title ?? "").trim().slice(0, 120),
+        snippet: (source.snippet ?? "").trim().slice(0, 220),
+        url: (source.url ?? "").trim().slice(0, 220),
+      }));
+
+      const findings =
+        compactSources.length > 0
+          ? compactSources
+              .map(
+                (s, sourceIndex) =>
+                  `${sourceIndex + 1}. ${s.title}: ${s.snippet}` +
+                  (s.url ? ` [${s.url}]` : ""),
+              )
+              .join("\n")
+          : "(no fresh results)";
+
+      return (
+        `CATEGORY ${index + 1}\n` +
+        `id:${spec.id}\n` +
+        `category:${spec.category}\n` +
+        `focus:${spec.focus}\n` +
+        `findings:\n${findings}`
+      );
+    })
+    .join("\n\n");
+    console.log( `[intelBatch] compact input chars=${intelligenceInput.length}`, );
+
+  // -------------------------------------------------------------------------
+  // 4. Deterministic fallback
+  // -------------------------------------------------------------------------
+
+  const fallback = {
+    factors: fallbacks.map((factor, index) => ({
+      category: specs[index].category,
+      score: factor.score,
+      label: factor.label,
+      actionable: factor.actionable,
+      detail: factor.detail,
+      trend: factor.trend,
+      keyFindings: factor.keyFindings,
+    })),
+  };
+
+  // -------------------------------------------------------------------------
+  // 5. ONE LLM call for ALL intelligence categories
+  // -------------------------------------------------------------------------
+  const compactContext = context.slice(0, 1200);
+  console.log(
+    `[intelBatch] Sending ${specs.length} categories in ONE LLM call...`,
+  );
+
+  let response: {
+    factors: Array<{
+      category: RiskCategory;
+      score: number;
+      label: string;
+      actionable: string;
+      detail: string;
+      trend: "up" | "down" | "flat";
+      keyFindings: string[];
+    }>;
+  };
+
+  try {
+    response = await jsonCompletion<{
+      factors: Array<{
+        category: RiskCategory;
+        score: number;
+        label: string;
+        actionable: string;
+        detail: string;
+        trend: "up" | "down" | "flat";
+        keyFindings: string[];
+      }>;
+    }>({
+      system:
+        `You are the central intelligence engine for an Indonesian supply-chain risk platform.
+        Analyze ALL provided intelligence categories in one pass.
+        For every category, assess risk from 0-100:
+        - 0 = calm / no meaningful risk
+        - 100 = severe disruption likely
+        Rules:
+        - Base the assessment ONLY on the provided live web findings and shipment context.
+        - Do not invent facts, prices, dates, regulations, disruptions, or statistics.
+        - If evidence is weak or unavailable, give a conservative score and explicitly reflect the uncertainty.
+        - Be specific to the shipment location and ship date.
+        - "actionable" MUST be exactly ONE concrete, time-bound action or insight.
+        - "detail" must contain 2-3 concise sentences.
+        - "label" must be a concise 3-5 word headline.
+        - "trend" MUST be exactly "up", "down", or "flat".
+        - "keyFindings" must contain 2-4 concise findings.
+
+        Return exactly one factor for every requested category.
+        Never omit a category.
+        Never add an unknown category.
+        Respond ONLY with valid JSON.`,
+
+      user:
+        `Shipment context: ${compactContext}  Intelligence categories and live findings:  ${intelligenceInput}  Return exactly:
+
+        {
+          "factors": [
+            {
+              "category": "commodity",
+              "score": 0,
+              "label": "3-5 word headline",
+              "actionable": "one concrete time-bound action",
+              "detail": "2-3 sentences",
+              "trend": "up",
+              "keyFindings": ["finding 1", "finding 2"]
+            }
+          ]
+        }`,
+
+      fallback,
+    agent: "intelBatch",
+    maxTokens: 2000,
+  });
+
+    console.log(
+      `[intelBatch] LLM returned ${
+        Array.isArray(response?.factors)
+          ? response.factors.length
+          : 0
+      } factors`,
+    );
+  } catch (error) {
+    console.error(
+      `[intelBatch] LLM failed, using deterministic fallback:`,
+      error,
+    );
+
+    response = fallback
+    agent: "intelBatch"
+    maxTokens: 1200
+  }
+
+  // -------------------------------------------------------------------------
+  // 6. Validate and normalize LLM output
+  // -------------------------------------------------------------------------
+
+  const validCategories = new Set(
+    specs.map((spec) => spec.category),
+  );
+
+  const normalizedFactors = Array.isArray(response?.factors)
+    ? response.factors.filter(
+        (factor) =>
+          factor &&
+          validCategories.has(factor.category),
+      )
+    : [];
+
+  // -------------------------------------------------------------------------
+  // 7. Merge LLM result with fallback
+  // -------------------------------------------------------------------------
+
+  const finalFactors = specs.map((spec, index) => {
+    const fallbackFactor = fallbacks[index];
+
+    const factor = normalizedFactors.find(
+      (item) => item.category === spec.category,
+    );
+
+    // Tidak ada hasil LLM untuk kategori ini.
+    if (!factor) {
+      console.warn(
+        `[intelBatch:${spec.id}] Missing LLM factor -> fallback`,
+      );
+
+      return {
+        ...fallbackFactor,
+        sources: searchResults[index].sources,
+      };
+    }
+
+    // -----------------------------------------------------------------------
+    // Validate score
+    // -----------------------------------------------------------------------
+
+    const rawScore = Number(factor.score);
+
+    const score = Number.isFinite(rawScore)
+      ? clamp(Math.round(rawScore))
+      : fallbackFactor.score;
+
+    // -----------------------------------------------------------------------
+    // Validate trend
+    // -----------------------------------------------------------------------
+
+    const trend =
+      factor.trend === "up" ||
+      factor.trend === "down" ||
+      factor.trend === "flat"
+        ? factor.trend
+        : fallbackFactor.trend;
+
+    // -----------------------------------------------------------------------
+    // Validate strings
+    // -----------------------------------------------------------------------
+
+    const label =
+      typeof factor.label === "string" &&
+      factor.label.trim().length > 0
+        ? factor.label.trim()
+        : fallbackFactor.label;
+
+    const detail =
+      typeof factor.detail === "string" &&
+      factor.detail.trim().length > 0
+        ? factor.detail.trim()
+        : fallbackFactor.detail;
+
+    const actionable =
+      typeof factor.actionable === "string" &&
+      factor.actionable.trim().length > 0
+        ? factor.actionable.trim()
+        : fallbackFactor.actionable;
+
+    // -----------------------------------------------------------------------
+    // Validate key findings
+    // -----------------------------------------------------------------------
+
+    const keyFindings =
+      Array.isArray(factor.keyFindings)
+        ? factor.keyFindings
+            .filter(
+              (finding): finding is string =>
+                typeof finding === "string" &&
+                finding.trim().length > 0,
+            )
+            .map((finding) => finding.trim())
+            .slice(0, 4)
+        : [];
+
+    return {
+      category: spec.category,
+      score,
+      label,
+      detail,
+      actionable,
+      trend,
+      keyFindings:
+        keyFindings.length > 0
+          ? keyFindings
+          : fallbackFactor.keyFindings.slice(0, 4),
+      sources: searchResults[index].sources,
+    };
+  });
+
+  // -------------------------------------------------------------------------
+  // 8. Final diagnostics
+  // -------------------------------------------------------------------------
+
+  const liveSourceCount = searchResults.reduce(
+    (total, result) => total + result.sources.length,
+    0,
+  );
+
+  const fallbackCount = finalFactors.filter((factor, index) => {
+    const llmFactor = normalizedFactors.find(
+      (item) => item.category === specs[index].category,
+    );
+
+    return !llmFactor;
+  }).length;
+
+  console.log(
+    `[intelBatch] Completed: ${finalFactors.length}/${specs.length} factors`,
+  );
+
+  console.log(
+    `[intelBatch] Live sources: ${liveSourceCount}`,
+  );
+
+  console.log(
+    `[intelBatch] Fallback factors: ${fallbackCount}`,
+  );
+
+  return finalFactors;
+}
+
 // ---------------------------------------------------------------------------
 // Port Recommendation Agent
-//   1. LLM proposes the realistic alternative entry ports for this lane
-//   2. Bright Data scrapes live congestion for each (parallel)
-//   3. LLM scores each + a synthesis pass picks the best with a rationale
-// ---------------------------------------------------------------------------
 
-export async function portRecommenderAgent(input: ShipmentInput): Promise<PortRecommendation | null> {
+export async function portRecommenderAgent(
+  input: ShipmentInput,
+): Promise<PortRecommendation | null> {
+  // ============================================================
+  // LLM #1 — Select realistic port candidates
+  // ============================================================
   const candidates = await jsonCompletion<{ ports: string[] }>({
     system:
       "You are an Indonesian maritime logistics routing expert. " +
@@ -249,79 +629,183 @@ export async function portRecommenderAgent(input: ShipmentInput): Promise<PortRe
       `Example: {"ports":["Tanjung Perak, Surabaya, Indonesia","Tanjung Emas, Semarang, Indonesia"]}`,
     fallback: {
       ports: [
-        `Tanjung Perak, Surabaya, Indonesia`,
-        `Tanjung Emas, Semarang, Indonesia`,
-        `Tanjung Priok, Jakarta, Indonesia`,
+        "Tanjung Perak, Surabaya, Indonesia",
+        "Tanjung Emas, Semarang, Indonesia",
+        "Tanjung Priok, Jakarta, Indonesia",
       ],
     },
+    agent: "portrecommendercandidates"
   });
 
-  const ports = (candidates.ports || []).filter(Boolean).slice(0, 4);
+  const ports = (candidates.ports || [])
+    .filter(Boolean)
+    .slice(0, 4);
+
   if (!ports.length) return null;
 
   const currentYear = new Date().getFullYear();
 
-  const scored: Omit<PortOption, "recommended" | "lat" | "lng" | "freightCost">[] = await Promise.all(
+  // ============================================================
+  // Bright Data — Search all ports in parallel
+  // NO LLM CALL HERE
+  // ============================================================
+  const portResearch = await Promise.all(
     ports.map(async (port: string) => {
-      const sources = await bdSearch(`${port} Indonesia port congestion dwell time vessel queue delays ${currentYear}`, 3);
-      const s = await jsonCompletion<{ congestionScore: number; waitDays: number; note: string }>({
-        system:
-          "You are an Indonesian port operations analyst. " +
-          "Assess the CURRENT congestion condition of the specified Indonesian port " +
-          "using only the provided web findings. " +
-          "Score congestion from 0-100, where 0 means clear operations and 100 means severe backlog. " +
-          "Estimate the likely berth, vessel, or container dwell waiting time in days. " +
-          "Do not invent precise operational statistics if the sources do not support them. " +
-          "When evidence is limited, provide a conservative estimate. " +
-          "Return JSON only.",
-        user:
-          `Port: ${port}\n\nFindings:\n${sources.map((x) => `- ${x.title}: ${x.snippet ?? ""}`).join("\n") || "(no fresh results)"}\n\n` +
-          `Return {"congestionScore": number, "waitDays": number, "note": string (one line)}`,
-        fallback: { congestionScore: 50, waitDays: 3, note: `${port}: conditions mixed.` },
-      });
+      const sources = await bdSearch(
+        `${port} Indonesia port congestion dwell time vessel queue delays ${currentYear}`,
+        3,
+      );
+
+      // Compact sources to reduce LLM payload size
+      const compactSources = sources.slice(0, 3).map((x) => ({
+        title: x.title?.slice(0, 160) ?? "",
+        snippet: x.snippet?.trim().slice(0, 500) ?? "",
+        url: x.url ?? "",
+      }));
+
       return {
-        name: port,
-        congestionScore: clamp(Math.round(s.congestionScore ?? 50)),
-        waitDays: Math.max(0, Math.round(s.waitDays ?? 3)),
-        note: s.note || `${port}: conditions mixed.`,
+        port,
         sources,
+        compactSources,
       };
     }),
   );
 
-  // Pick the best: lowest congestion, tie-break on wait. Then write a rationale
-  // comparing it to the intended destination.
-  const best = [...scored].sort(
-    (a, b) => a.congestionScore - b.congestionScore || a.waitDays - b.waitDays,
-  )[0];
-
-  const intended = scored[0];
-  const rationale = await textCompletion({
+  // ============================================================
+  // LLM #2 — Analyze ALL ports + select best + rationale
+  // ============================================================
+  const analysis = await jsonCompletion<{
+    ports: Array<{
+      name: string;
+      congestionScore: number;
+      waitDays: number;
+      note: string;
+    }>;
+    recommended: string;
+    rationale: string;
+  }>({
     system:
-      "You are an Indonesian logistics advisor. " +
-      "Explain the recommended Indonesian entry port in 1-2 concise sentences. " +
-      "Compare it with the primary destination port and mention congestion " +
-      "and estimated waiting-time differences. " +
-      "Use clear business language. Plain text only.",
+      "You are an Indonesian port operations analyst and logistics advisor. " +
+      "Analyze all provided Indonesian port candidates using ONLY the supplied web findings. " +
+      "For each port, estimate congestion from 0-100 and likely waiting time in days. " +
+      "Do not invent precise operational statistics when evidence is unavailable. " +
+      "When evidence is limited, use conservative estimates. " +
+      "Then select the best port based primarily on congestion and waiting time. " +
+      "The recommended port should be one of the provided candidates. " +
+      "Return JSON only.",
+
     user:
-      `Intended port: ${intended.name} (congestion ${intended.congestionScore}/100, ~${intended.waitDays}d wait). ` +
-      `Recommended: ${best.name} (congestion ${best.congestionScore}/100, ~${best.waitDays}d wait). ` +
-      `All options: ${scored.map((p) => `${p.name} ${p.congestionScore}/100`).join(", ")}.`,
-    fallback:
-      best.name === intended.name
-        ? `${best.name} remains the best entry port; alternatives offer no congestion advantage.`
-        : `Route through ${best.name} instead of ${intended.name} — congestion is ${intended.congestionScore - best.congestionScore} points lower, saving roughly ${Math.max(0, intended.waitDays - best.waitDays)} days of port wait.`,
+      `Shipment:\n` +
+      `Origin: ${input.origin_city}, ${input.origin_province}\n` +
+      `Destination: ${input.destination_city}, ${input.destination_province}\n` +
+      `Shipping mode: ${input.shippingMode || "not specified"}\n\n` +
+
+      `Port candidates and web findings:\n` +
+
+      portResearch
+        .map(
+          ({ port, compactSources }) =>
+            `PORT: ${port}\n` +
+            `${
+              compactSources.length
+                ? compactSources
+                    .map(
+                      (x) =>
+                        `- ${x.title}: ${x.snippet}`,
+                    )
+                    .join("\n")
+                : "- No fresh web findings available"
+            }`,
+        )
+        .join("\n\n") +
+
+      `\n\nReturn JSON in exactly this structure:\n` +
+      `{"ports":[` +
+      `{"name":"Port Name","congestionScore":50,"waitDays":3,"note":"short note"}` +
+      `],"recommended":"Port Name","rationale":"1-2 concise sentences comparing the recommended port with alternatives."}`,
+
+    fallback: {
+      ports: ports.map((port) => ({
+        name: port,
+        congestionScore: 50,
+        waitDays: 3,
+        note: `${port}: conditions mixed.`,
+      })),
+      recommended: ports[0],
+      rationale:
+        `${ports[0]} is the primary candidate for the destination; ` +
+        `current congestion evidence is limited, so alternatives should be monitored.`,
+    },
+    agent: "portrecommenderanalyze",
+    maxTokens: 600
+    
   });
+
+  // ============================================================
+  // Normalize LLM output
+  // ============================================================
+  const analyzedPorts = Array.isArray(analysis.ports)
+    ? analysis.ports
+    : [];
+
+  const scored: Omit<
+    PortOption,
+    "recommended" | "lat" | "lng" | "freightCost"
+  >[] = ports.map((port) => {
+    const result = analyzedPorts.find(
+      (p) =>
+        p.name?.toLowerCase().trim() ===
+        port.toLowerCase().trim(),
+    );
+
+    return {
+      name: port,
+      congestionScore: clamp(
+        Math.round(result?.congestionScore ?? 50),
+      ),
+      waitDays: Math.max(
+        0,
+        Math.round(result?.waitDays ?? 3),
+      ),
+      note:
+        result?.note ||
+        `${port}: conditions mixed.`,
+      sources:
+        portResearch.find((x) => x.port === port)?.sources || [],
+    };
+  });
+
+  // ============================================================
+  // Select best port deterministically
+  // ============================================================
+  const best =
+    scored.find(
+      (p) =>
+        p.name === analysis.recommended,
+    ) ??
+    [...scored].sort(
+      (a, b) =>
+        a.congestionScore - b.congestionScore ||
+        a.waitDays - b.waitDays,
+    )[0];
+
+  if (!best) return null;
 
   const options: PortOption[] = scored.map((p) => ({
     ...p,
     recommended: p.name === best.name,
-    freightCost: 0, // filled in by the orchestrator from the freight baseline
+    freightCost: 0,
     lat: null,
     lng: null,
   }));
 
-  return { recommended: best.name, rationale, options };
+  return {
+    recommended: best.name,
+    rationale:
+      analysis.rationale ||
+      `${best.name} is the recommended port based on the available congestion and waiting-time evidence.`,
+    options,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -410,6 +894,7 @@ export async function regulatoryAgent(
       `}`,
 
     fallback,
+    agent: "regulatory"
     });
 
   // 4. Normalize documents
@@ -516,6 +1001,7 @@ export async function intake(text: string, current?: Partial<ShipmentInput>): Pr
         weightKg: 0,
         shipDate: "",
     },
+    agent: "intake"
   });
 
   const newReqs = normalizeReqs(extracted.specialRaw || "");
@@ -611,6 +1097,8 @@ export async function enrichDriverPrices(drivers: DependencyDriver[]): Promise<D
         `Items:\n${JSON.stringify(payload)}\n\n` +
         `Return JSON: {"items":[{"id":number,"currentPrice":number,"unit":string,"forecastPct":number,"forecastNote":string}]}`,
     fallback: { items: [] },
+    agent: "enrichdriverprices",
+    maxTokens: 1000
   });
 
   const items = Array.isArray(out.items) ? out.items : [];
@@ -737,6 +1225,8 @@ export async function synthesisAgent(
       `  "alerts": [{"severity":"high|medium|low","title":string,"impact":string}],\n` +
       `  "recommendations": [{"action":string,"rationale":string}]\n}`,
     fallback,
+    agent: "synthesis",
+    maxTokens: 1200
   });
 
   return {
@@ -786,6 +1276,7 @@ export async function actionPlanAgent(
         `Return JSON: {"items":[{"action":string,"deadline":string,"dueDate":"YYYY-MM-DD"|null,` +
         `"category":string,"urgency":"high"|"medium"|"low","why":string}]}`,
     fallback: { items: fallback },
+    agent: "actionplan"
   });
 
   const items = plan.items?.length ? plan.items : fallback;
@@ -902,4 +1393,147 @@ function defaultRoutes(input: ShipmentInput): RouteOption[] {
     { method: "Rail Freight", cost: Math.round(truckCost * 0.8), transitDays: 4, recommended: false, note: "Suitable for routes connected by Indonesia's rail network." },
     { method: "Air Freight", cost: airCost, transitDays: 1, recommended: false, note: "Fastest option; significantly higher cost for time-critical cargo." },
   ];
+}
+
+function compactSource(
+  source: {
+    title?: string;
+    snippet?: string;
+    url?: string;
+  },
+) {
+  return {
+    title: (source.title ?? "").trim().slice(0, 160),
+    snippet: (source.snippet ?? "").trim().slice(0, 350),
+    url: (source.url ?? "").trim(),
+  };
+}
+
+export async function finalDecisionAgent(
+  input: ShipmentInput,
+  factors: RiskFactor[],
+  riskScore: number,
+  synthesis: SynthesisOutput,
+): Promise<{
+  executiveSummary: string;
+  actionPlan: ActionItem[];
+}> {
+  const top = [...factors]
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 5);
+
+  const fallbackSummary =
+    `Three major risks currently affect this shipment: ${top
+      .map((f) => f.label)
+      .join("; ")}. Expected impact: +${synthesis.expectedCostIncreasePct}% cost and a ` +
+    `${synthesis.expectedDelayDays[0]}–${synthesis.expectedDelayDays[1]} day delay.`;
+
+  const fallbackPlan: ActionItem[] = factors
+    .filter((f) => f.score >= 45)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 6)
+    .map((f) => ({
+      action: f.actionable,
+      deadline: "Before booking",
+      dueDate: null,
+      category: f.category,
+      urgency:
+        f.score >= 70
+          ? "high"
+          : f.score >= 55
+            ? "medium"
+            : "low",
+      why: f.label,
+    }));
+
+  const result = await jsonCompletion<{
+    executiveSummary: string;
+    actionPlan: ActionItem[];
+  }>({
+
+    system:
+      "You are the final logistics decision assistant. " +
+      "Generate a concise executive summary and a deduplicated action plan " +
+      "from the structured risk analysis below. " +
+      "Do not invent facts. Do not discuss raw web searches. " +
+      "The executive summary must be 3-4 concise sentences. " +
+      "The action plan must contain 5-8 concrete actions. " +
+      "Use real dates derived from the ship date when possible. " +
+      "Return ONLY valid JSON.",
+
+    user:
+      `Shipment:
+      ${input.product}, ${input.origin_city}, ${input.origin_province} -> ${input.destination_city}, ${input.destination_province}
+      Ship date: ${input.shipDate}
+      Shipping mode: ${input.shippingMode || "not specified"}
+
+      Overall risk: ${riskScore}/100
+
+      Top risk factors:
+      ${top
+        .map(
+          (f) =>
+            `- ${f.category}: risk ${f.score}, ${f.label}. Action: ${f.actionable}`,
+        )
+        .join("\n")}
+
+      Cost impact:
+      +${synthesis.expectedCostIncreasePct}% expected cost increase
+
+      Expected delay:
+      ${synthesis.expectedDelayDays[0]}-${synthesis.expectedDelayDays[1]} days
+
+      Recommendations:
+      ${synthesis.recommendations
+        .slice(0, 5)
+        .map((r) => `- ${r.action}: ${r.rationale}`)
+        .join("\n")}
+
+      Return:
+      {
+        "executiveSummary": "3-4 concise sentences",
+        "actionPlan": [
+          {
+            "action": "short imperative action",
+            "deadline": "concrete deadline",
+            "dueDate": "YYYY-MM-DD or null",
+            "category": "risk category",
+            "urgency": "high|medium|low",
+            "why": "one-line explanation"
+          }
+        ]
+      }`,
+
+    fallback: {
+      executiveSummary: fallbackSummary,
+      actionPlan: fallbackPlan,
+    },
+    agent: "finalDecision",
+    maxTokens: 1500,
+  });
+
+  const executiveSummary =
+    typeof result.executiveSummary === "string" &&
+    result.executiveSummary.trim()
+      ? result.executiveSummary.trim()
+      : fallbackSummary;
+
+  const actionPlan =
+    Array.isArray(result.actionPlan) && result.actionPlan.length
+      ? result.actionPlan
+          .slice(0, 8)
+          .sort((a: ActionItem, b: ActionItem) => {
+            if (a.dueDate && b.dueDate) {
+              return a.dueDate.localeCompare(b.dueDate);
+            }
+            if (a.dueDate) return -1;
+            if (b.dueDate) return 1;
+            return 0;
+          })
+      : fallbackPlan;
+
+  return {
+    executiveSummary,
+    actionPlan,
+  };
 }

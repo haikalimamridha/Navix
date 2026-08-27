@@ -137,7 +137,7 @@ export async function bdSearch(query: string, limit = 5): Promise<Source[]> {
           name: "search_engine",
           arguments: { query, engine: "google" },
         }),
-        18_000, // a slow query falls back to mock rather than stalling the run
+        30_000, // a slow query falls back to mock rather than stalling the run
       );
       const text = textFromToolResult(res);
       const sources = parseSources(text, limit);
