@@ -517,10 +517,7 @@ export default function Home() {
             {/* Hero */}
             <div className="text-center mb-10">
               <h1 className="font-semibold text-4xl sm:text-5xl">
-                Predict supply chain risk
-                <span className="text-accent">
-                  {" "}before it happens.
-                </span>
+                Predict supply chain risk before it happens.
               </h1>
 
               <p className="text-sm text-muted max-w-xl mx-auto mt-4 leading-6">
